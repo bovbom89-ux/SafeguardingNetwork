@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 
 const fs = require("node:fs");
@@ -832,7 +833,7 @@ async function finishTicketClose(interaction) {
         `Ticket owner: <@${record.owner}>`,
         `Closed by: ${interaction.user}`,
         `Category: ${TICKET_CATEGORIES[record.category]?.label || "Unknown"}`,
-        `Messages included: Transcript attached.`
+        "Messages included: Transcript attached."
       ].join("\n"),
       [transcriptFile]
     );
@@ -2211,33 +2212,76 @@ client.on("messageCreate", async message => {
 });
 
 // ==========================================
-// READY EVENT AND COMMAND REGISTRATION
+// READY EVENT
 // ==========================================
 
-client.once("clientReady", async readyClient => {
-  console.log(
-    `Safeguarding Assistant is online as ${readyClient.user.tag}.`
-  );
+client.once("clientReady", readyClient => {
+  console.log("------------------------------------");
+  console.log("Safeguarding Assistant is online.");
+  console.log(`Logged in as: ${readyClient.user.tag}`);
+  console.log(`Bot ID: ${readyClient.user.id}`);
+
+  if (readyClient.user.id !== CLIENT_ID) {
+    console.error("WARNING: DISCORD_CLIENT_ID does not match the logged-in bot ID.");
+    console.error("Check the DISCORD_CLIENT_ID environment variable.");
+  }
+
+  console.log("------------------------------------");
+});
+
+// ==========================================
+// STARTUP AND SLASH COMMAND REGISTRATION
+// ==========================================
+
+async function startBot() {
+  console.log("------------------------------------");
+  console.log("Safeguarding Assistant starting...");
+  console.log("------------------------------------");
+
+  console.log(`Application ID: ${CLIENT_ID}`);
+  console.log(`Server ID: ${GUILD_ID}`);
+  console.log(`Commands prepared: ${commands.length}`);
 
   try {
     const rest = new REST({ version: "10" }).setToken(TOKEN);
 
-    await rest.put(
+    console.log("Registering slash commands with Discord...");
+
+    const registeredCommands = await rest.put(
       Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
-      { body: commands }
+      {
+        body: commands
+      }
     );
 
-    console.log(
-      `${commands.length} slash commands registered successfully.`
-    );
+    console.log("------------------------------------");
+    console.log("COMMAND REGISTRATION SUCCESSFUL");
+    console.log(`Discord confirmed: ${registeredCommands.length} commands`);
+
+    registeredCommands.forEach(command => {
+      console.log(`Registered: /${command.name}`);
+    });
+
+    console.log("------------------------------------");
 
   } catch (error) {
-    console.error("Command registration failed:", error);
+    console.error("------------------------------------");
+    console.error("SLASH COMMAND REGISTRATION FAILED");
+    console.error("Error code:", error.code || "Unknown");
+    console.error("Error message:", error.message);
+    console.error("------------------------------------");
   }
+
+  console.log("Connecting to Discord...");
+
+  await client.login(TOKEN);
+}
+
+// ==========================================
+// START
+// ==========================================
+
+startBot().catch(error => {
+  console.error("Bot startup failed:", error);
+  process.exitCode = 1;
 });
-
-// ==========================================
-// LOGIN
-// ==========================================
-
-client.login(TOKEN);
