@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const fs = require("node:fs");
@@ -18,7 +17,11 @@ const {
   StringSelectMenuBuilder,
   ButtonBuilder,
   ButtonStyle,
-  MessageFlags
+  MessageFlags,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  AttachmentBuilder
 } = require("discord.js");
 
 // ==========================================
@@ -28,9 +31,7 @@ const {
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const GUILD_ID = process.env.DISCORD_GUILD_ID;
-
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const AI_CHAT_CHANNEL_ID = process.env.AI_CHAT_CHANNEL_ID;
 
 if (!TOKEN || !CLIENT_ID || !GUILD_ID) {
   throw new Error(
@@ -67,29 +68,34 @@ const warnings = loadJSON(WARNINGS_FILE);
 
 function getConfig(guildId) {
   if (!configs[guildId]) {
-    configs[guildId] = {
-      ticketCategory: null,
-      staffRole: null,
-      logsChannel: null,
-      panelChannel: null,
-      safetyRole: null,
-      onlineRole: null,
-      maxOpenTickets: 2
-    };
-
-    saveJSON(CONFIG_FILE, configs);
+    configs[guildId] = {};
   }
 
-  return configs[guildId];
+  const config = configs[guildId];
+
+  config.staffRole ??= null;
+  config.panelChannel ??= null;
+  config.ticketCategory ??= null;
+  config.logsChannel ??= null;
+  config.aiChannel ??= null;
+  config.aiEnabled ??= true;
+  config.ticketRecords ??= {};
+
+  saveJSON(CONFIG_FILE, configs);
+
+  return config;
 }
+
+const COLOUR = 0x018C8E;
+const FOOTER = "The Safeguarding Network";
 
 // ==========================================
 // CLIENT
 // ==========================================
 
-// GuildMembers is deliberately NOT enabled.
-// MessageContent must be enabled in the
-// Discord Developer Portal for AI chat.
+// Message Content Intent must be enabled in the
+// Discord Developer Portal under Bot > Privileged
+// Gateway Intents.
 
 const client = new Client({
   intents: [
@@ -98,9 +104,6 @@ const client = new Client({
     GatewayIntentBits.MessageContent
   ]
 });
-
-const COLOUR = 0x018C8E;
-const FOOTER = "The Safeguarding Network";
 
 // ==========================================
 // EMBEDS
@@ -178,10 +181,101 @@ const TICKET_CATEGORIES = {
 };
 
 // ==========================================
+// GENERAL HELPERS
+// ==========================================
+
+function isAdmin(interaction) {
+  return interaction.memberPermissions?.has(
+    PermissionFlagsBits.Administrator
+  );
+}
+
+function isSupport(member, config) {
+  return (
+    member.permissions.has(PermissionFlagsBits.Administrator) ||
+    (config.staffRole && member.roles.cache.has(config.staffRole))
+  );
+}
+
+async function getTicketMember(interaction) {
+  return interaction.guild.members.fetch(interaction.user.id);
+}
+
+async function getTicketRecord(channel) {
+  const match = channel.topic?.match(/ticket-owner:(\d+)/);
+
+  if (!match) return null;
+
+  const config = getConfig(channel.guild.id);
+  const record = config.ticketRecords[channel.id];
+
+  if (record) return record;
+
+  return {
+    owner: match[1],
+    category: channel.topic.match(/ticket-type:([a-z]+)/)?.[1] || "general",
+    claimedBy: null,
+    openedAt: new Date().toISOString()
+  };
+}
+
+async function checkSupportPermission(interaction) {
+  const config = getConfig(interaction.guild.id);
+  const member = await getTicketMember(interaction);
+
+  if (!isSupport(member, config)) {
+    await interaction.reply({
+      content: "Only the configured support team can use this ticket control.",
+      flags: MessageFlags.Ephemeral
+    });
+
+    return false;
+  }
+
+  return true;
+}
+
+// ==========================================
+// AUTOMATIC CHANNEL CREATION
+// ==========================================
+
+async function ensureTicketChannels(guild, config) {
+  let ticketCategory = config.ticketCategory
+    ? guild.channels.cache.get(config.ticketCategory)
+    : null;
+
+  if (!ticketCategory || ticketCategory.type !== ChannelType.GuildCategory) {
+    ticketCategory = await guild.channels.create({
+      name: "Support Tickets",
+      type: ChannelType.GuildCategory
+    });
+
+    config.ticketCategory = ticketCategory.id;
+  }
+
+  let logsChannel = config.logsChannel
+    ? guild.channels.cache.get(config.logsChannel)
+    : null;
+
+  if (!logsChannel || logsChannel.type !== ChannelType.GuildText) {
+    logsChannel = await guild.channels.create({
+      name: "support-logs",
+      type: ChannelType.GuildText
+    });
+
+    config.logsChannel = logsChannel.id;
+  }
+
+  saveJSON(CONFIG_FILE, configs);
+
+  return { ticketCategory, logsChannel };
+}
+
+// ==========================================
 // LOGGING
 // ==========================================
 
-async function sendLog(guild, description) {
+async function sendLog(guild, description, files = []) {
   const config = getConfig(guild.id);
 
   if (!config.logsChannel) return;
@@ -191,7 +285,8 @@ async function sendLog(guild, description) {
   if (!channel || !channel.isTextBased()) return;
 
   await channel.send({
-    embeds: [makeEmbed("System Log", description)]
+    embeds: [makeEmbed("Support System Log", description)],
+    files
   }).catch(console.error);
 }
 
@@ -201,28 +296,28 @@ async function sendLog(guild, description) {
 
 function createTicketPanel() {
   const embed = makeEmbed(
-    "The Safeguarding Network Support Centre",
+    "TSN | Support Centre",
     [
-      "> Welcome to The Safeguarding Network Support Centre, If you require assistance, have an enquiry or wish to raise a concern, select the most appropriate category below.",
+      "Welcome to The Safeguarding Network Support Centre. If you require assistance, have an enquiry or wish to raise a concern, select the most appropriate category below.",
       "",
-      "__**Available Support Categories**__",
+      "**Available Support Categories**",
       "",
-      "> • General Enquiries",
-      "> • Personal Support",
-      "> • Safety Concerns",
-      "> • Online Concerns",
-      "> • Further Assistance",
-      "> • Report a User",
-      "> • Staffing Enquiries",
+      "> General Enquiries",
+      "> Personal Support",
+      "> Safety Concerns",
+      "> Online Concerns",
+      "> Further Assistance",
+      "> Report a User",
+      "> Staffing Enquiries",
       "",
-      "__**Before opening a ticket**__",
+      "**Before opening a ticket**",
       "",
-      "> • Select the category most relevant to your enquiry.",
-      "> • Treat staff members respectfully.",
-      "> • Only share information relevant to your enquiry.",
-      "> • Tickets are private to the member and authorised staff, but are not guaranteed confidential.",
+      "> Select the category most relevant to your enquiry.",
+      "> Treat staff members respectfully.",
+      "> Only share information relevant to your enquiry.",
+      "> Tickets are private to the member and authorised staff, but are not guaranteed confidential.",
       "",
-      "> The Safeguarding Network is an independent community. This ticket system does not replace professional safeguarding services or emergency assistance.",
+      "The Safeguarding Network is an independent community. This ticket system does not replace professional safeguarding services or emergency assistance.",
       "",
       "**Select a support category below to get started.**"
     ].join("\n")
@@ -248,6 +343,66 @@ function createTicketPanel() {
 }
 
 // ==========================================
+// TICKET EMBED
+// ==========================================
+
+function createTicketEmbed(record) {
+  const category = TICKET_CATEGORIES[record.category];
+
+  return makeEmbed(
+    category?.title || "Support Ticket",
+    [
+      category?.message || "Welcome to your support ticket.",
+      "",
+      "**Ticket Information**",
+      `Category: ${category?.label || "Unknown"}`,
+      `Status: ${record.claimedBy ? "Claimed" : "Unclaimed"}`,
+      `Assigned staff: ${record.claimedBy ? `<@${record.claimedBy}>` : "None"}`,
+      `Ticket owner: <@${record.owner}>`
+    ].join("\n")
+  );
+}
+
+function createTicketButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("ticket_claim")
+      .setLabel("Claim")
+      .setStyle(ButtonStyle.Success),
+
+    new ButtonBuilder()
+      .setCustomId("ticket_close")
+      .setLabel("Close")
+      .setStyle(ButtonStyle.Danger),
+
+    new ButtonBuilder()
+      .setCustomId("ticket_modpanel")
+      .setLabel("Mod Panel")
+      .setStyle(ButtonStyle.Secondary)
+  );
+}
+
+async function updateTicketEmbed(channel, record) {
+  const messages = await channel.messages.fetch({ limit: 30 });
+
+  const ticketMessage = messages.find(message =>
+    message.author.id === client.user.id &&
+    message.components.some(row =>
+      row.components.some(component =>
+        component.customId === "ticket_claim"
+      )
+    )
+  );
+
+  if (!ticketMessage) return;
+
+  await ticketMessage.edit({
+    embeds: [createTicketEmbed(record)],
+    components: [createTicketButtons()]
+  });
+}
+
+// ==========================================
 // TICKET CREATION
 // ==========================================
 
@@ -263,35 +418,18 @@ async function createTicket(interaction, categoryKey) {
     });
   }
 
-  if (!config.ticketCategory || !config.staffRole) {
+  if (!config.staffRole) {
     return interaction.reply({
-      content: "The ticket system has not been fully configured. Please contact a server administrator.",
+      content: "The ticket system has not been configured. Please contact an administrator.",
       flags: MessageFlags.Ephemeral
     });
   }
 
-  const discordCategory = guild.channels.cache.get(config.ticketCategory);
   const staffRole = guild.roles.cache.get(config.staffRole);
 
-  if (
-    !discordCategory ||
-    discordCategory.type !== ChannelType.GuildCategory ||
-    !staffRole
-  ) {
+  if (!staffRole) {
     return interaction.reply({
-      content: "The configured ticket category or staff role could not be found. Please contact an administrator.",
-      flags: MessageFlags.Ephemeral
-    });
-  }
-
-  const openTickets = guild.channels.cache.filter(channel =>
-    channel.type === ChannelType.GuildText &&
-    channel.topic?.includes(`ticket-owner:${interaction.user.id}`)
-  );
-
-  if (openTickets.size >= config.maxOpenTickets) {
-    return interaction.reply({
-      content: `You already have ${openTickets.size} open ticket(s). Please close an existing ticket before opening another.`,
+      content: "The configured support role could not be found.",
       flags: MessageFlags.Ephemeral
     });
   }
@@ -300,101 +438,85 @@ async function createTicket(interaction, categoryKey) {
     flags: MessageFlags.Ephemeral
   });
 
-  let notificationRole = staffRole;
-
-  if (categoryKey === "safety" && config.safetyRole) {
-    notificationRole =
-      guild.roles.cache.get(config.safetyRole) || staffRole;
-  }
-
-  if (categoryKey === "online" && config.onlineRole) {
-    notificationRole =
-      guild.roles.cache.get(config.onlineRole) || staffRole;
-  }
-
-  const safeName = interaction.user.username
-    .toLowerCase()
-    .replace(/[^a-z0-9-]/g, "")
-    .slice(0, 15) || "member";
-
   try {
-    const permissionOverwrites = [
-      {
-        id: guild.roles.everyone.id,
-        deny: [PermissionFlagsBits.ViewChannel]
-      },
-      {
-        id: interaction.user.id,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ReadMessageHistory,
-          PermissionFlagsBits.AttachFiles,
-          PermissionFlagsBits.EmbedLinks
-        ]
-      },
-      {
-        id: staffRole.id,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ReadMessageHistory,
-          PermissionFlagsBits.ManageMessages
-        ]
-      },
-      {
-        id: client.user.id,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ReadMessageHistory,
-          PermissionFlagsBits.ManageChannels
-        ]
-      }
-    ];
+    const { ticketCategory } = await ensureTicketChannels(guild, config);
 
-    if (
-      notificationRole.id !== staffRole.id &&
-      notificationRole.id !== guild.roles.everyone.id
-    ) {
-      permissionOverwrites.push({
-        id: notificationRole.id,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ReadMessageHistory
-        ]
+    const openTickets = guild.channels.cache.filter(channel =>
+      channel.type === ChannelType.GuildText &&
+      channel.topic?.includes(`ticket-owner:${interaction.user.id}`)
+    );
+
+    if (openTickets.size >= 2) {
+      return interaction.editReply({
+        content: "You already have two open tickets. Please wait for an existing ticket to be closed."
       });
     }
+
+    const safeName = interaction.user.username
+      .toLowerCase()
+      .replace(/[^a-z0-9-]/g, "")
+      .slice(0, 15) || "member";
 
     const channel = await guild.channels.create({
       name: `${categoryKey}-${safeName}`,
       type: ChannelType.GuildText,
-      parent: discordCategory.id,
+      parent: ticketCategory.id,
       topic: `ticket-owner:${interaction.user.id} | ticket-type:${categoryKey}`,
-      permissionOverwrites
+      permissionOverwrites: [
+        {
+          id: guild.roles.everyone.id,
+          deny: [PermissionFlagsBits.ViewChannel]
+        },
+        {
+          id: interaction.user.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.AttachFiles,
+            PermissionFlagsBits.EmbedLinks
+          ]
+        },
+        {
+          id: staffRole.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.ManageMessages
+          ]
+        },
+        {
+          id: client.user.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.ManageChannels,
+            PermissionFlagsBits.ManageMessages
+          ]
+        }
+      ]
     });
 
-    const embed = makeEmbed(
-      category.title,
-      category.message
-    );
+    const record = {
+      owner: interaction.user.id,
+      category: categoryKey,
+      claimedBy: null,
+      openedAt: new Date().toISOString()
+    };
 
-    const closeButton = new ButtonBuilder()
-      .setCustomId("ticket_close")
-      .setLabel("Close Ticket")
-      .setStyle(ButtonStyle.Danger);
-
-    const row = new ActionRowBuilder().addComponents(closeButton);
+    config.ticketRecords[channel.id] = record;
+    saveJSON(CONFIG_FILE, configs);
 
     await channel.send({
-      content: `${interaction.user} <@&${notificationRole.id}>`,
+      content: `${interaction.user} <@&${staffRole.id}>`,
       allowedMentions: {
         users: [interaction.user.id],
-        roles: [notificationRole.id]
+        roles: [staffRole.id]
       },
-      embeds: [embed],
-      components: [row]
+      embeds: [createTicketEmbed(record)],
+      components: [createTicketButtons()]
     });
 
     await interaction.editReply({
@@ -403,7 +525,7 @@ async function createTicket(interaction, categoryKey) {
 
     await sendLog(
       guild,
-      `A ticket was opened by ${interaction.user.tag}.\nCategory: ${category.label}\nChannel: ${channel}`
+      `Ticket opened.\nOwner: <@${interaction.user.id}>\nCategory: ${category.label}\nChannel: ${channel}`
     );
 
   } catch (error) {
@@ -416,217 +538,586 @@ async function createTicket(interaction, categoryKey) {
 }
 
 // ==========================================
-// TICKET CLOSING
+// CLAIM TICKET
 // ==========================================
 
-async function closeTicket(interaction) {
+async function claimTicket(interaction) {
+  if (!(await checkSupportPermission(interaction))) return;
+
   const channel = interaction.channel;
-  const guild = interaction.guild;
-  const config = getConfig(guild.id);
+  const config = getConfig(interaction.guild.id);
+  const record = await getTicketRecord(channel);
 
-  const ownerMatch = channel.topic?.match(/ticket-owner:(\d+)/);
-
-  if (!ownerMatch) {
+  if (!record) {
     return interaction.reply({
       content: "This channel is not recognised as a ticket.",
       flags: MessageFlags.Ephemeral
     });
   }
 
-  const ownerId = ownerMatch[1];
-  const isOwner = interaction.user.id === ownerId;
-
-  const member = await guild.members.fetch(interaction.user.id);
-
-  const isStaff = config.staffRole
-    ? member.roles.cache.has(config.staffRole)
-    : false;
-
-  const canManage = interaction.memberPermissions?.has(
-    PermissionFlagsBits.ManageChannels
-  );
-
-  if (!isOwner && !isStaff && !canManage) {
+  if (record.claimedBy && record.claimedBy !== interaction.user.id) {
     return interaction.reply({
-      content: "You do not have permission to close this ticket.",
+      content: `This ticket has already been claimed by <@${record.claimedBy}>.`,
       flags: MessageFlags.Ephemeral
     });
   }
 
+  if (record.claimedBy === interaction.user.id) {
+    return interaction.reply({
+      content: "You have already claimed this ticket.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  record.claimedBy = interaction.user.id;
+  config.ticketRecords[channel.id] = record;
+  saveJSON(CONFIG_FILE, configs);
+
+  await updateTicketEmbed(channel, record);
+
   await interaction.reply({
-    embeds: [
-      makeEmbed(
-        "Ticket Closed",
-        `This ticket has been closed by ${interaction.user}.`
-      )
-    ],
-    components: []
+    content: "You have successfully claimed this ticket.",
+    flags: MessageFlags.Ephemeral
   });
 
   await sendLog(
-    guild,
-    `Ticket closed.\nChannel: ${channel.name}\nClosed by: ${interaction.user.tag}\nTicket owner: <@${ownerId}>`
+    interaction.guild,
+    `Ticket claimed.\nChannel: ${channel}\nClaimed by: ${interaction.user}`
   );
-
-  setTimeout(async () => {
-    await channel.delete("Ticket closed").catch(console.error);
-  }, 5000);
 }
 
 // ==========================================
-// AI CHATBOT
+// CLOSE TICKET
 // ==========================================
 
-// Conversation history is held temporarily in memory.
-// It is not written to the bot's JSON files.
+async function requestTicketClose(interaction) {
+  if (!(await checkSupportPermission(interaction))) return;
 
-const aiConversations = new Map();
-const aiCooldowns = new Map();
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("ticket_close_confirm")
+      .setLabel("Confirm Close")
+      .setStyle(ButtonStyle.Danger),
 
-const AI_MODEL = "gpt-4.1-mini";
-const MAX_HISTORY_MESSAGES = 10;
-const AI_COOLDOWN_MS = 4000;
+    new ButtonBuilder()
+      .setCustomId("ticket_close_cancel")
+      .setLabel("Cancel")
+      .setStyle(ButtonStyle.Secondary)
+  );
 
-const AI_SYSTEM_PROMPT = `
-You are Safeguarding Assistant's AI chatbot in The Safeguarding Network (TSN).
+  return interaction.reply({
+    embeds: [
+      makeEmbed(
+        "Close Ticket",
+        "Are you sure you want to close this ticket? A transcript will be saved to the support logs channel."
+      )
+    ],
+    components: [row],
+    flags: MessageFlags.Ephemeral
+  });
+}
 
-Your purpose is to provide friendly, clear and useful general information
-and answer everyday questions.
+async function finishTicketClose(interaction) {
+  if (!(await checkSupportPermission(interaction))) return;
 
-IMPORTANT GUIDELINES:
+  const channel = interaction.channel;
+  const config = getConfig(interaction.guild.id);
+  const record = await getTicketRecord(channel);
 
-1. You are an AI assistant, not a human staff member.
-2. You are not a professional safeguarding service, emergency service,
-   therapist, doctor, lawyer or official authority.
-3. Never claim to investigate, report, escalate or contact anyone.
-4. Do not promise confidentiality or secrecy.
-5. Do not ask users for passwords, addresses, phone numbers or unnecessary
-   identifying information.
-6. Do not encourage users to share sensitive personal information in
-   a public Discord channel.
-7. If someone describes immediate danger in the UK, advise them to call 999.
-   If they are unsure what to do, encourage them to speak to a trusted adult
-   or appropriate professional.
-8. For safeguarding concerns, encourage users to contact an appropriate
-   trusted adult or professional service. Do not attempt to investigate.
-9. Respond calmly and supportively to distressing topics.
-10. Do not provide instructions that facilitate harm, abuse, exploitation
-    or dangerous behaviour.
-11. Do not invent facts, policies, server rules or staff decisions.
-12. Explain when you are uncertain.
-13. Keep answers reasonably concise and easy to understand.
-14. Do not claim to represent an official safeguarding authority.
-
-The Safeguarding Network is an independent community.
-`;
-
-// ==========================================
-// AI MESSAGE HANDLER
-// ==========================================
-
-async function handleAIMessage(message) {
-  if (!openai || !AI_CHAT_CHANNEL_ID) return;
-  if (message.author.bot || !message.guild) return;
-  if (message.channel.id !== AI_CHAT_CHANNEL_ID) return;
-
-  const now = Date.now();
-  const lastMessage = aiCooldowns.get(message.author.id) || 0;
-
-  if (now - lastMessage < AI_COOLDOWN_MS) return;
-
-  aiCooldowns.set(message.author.id, now);
-
-  const conversationKey = `${message.guild.id}:${message.author.id}`;
-
-  if (!aiConversations.has(conversationKey)) {
-    aiConversations.set(conversationKey, []);
-  }
-
-  const history = aiConversations.get(conversationKey);
-
-  const userMessage = message.content.trim();
-
-  if (!userMessage) return;
-
-  if (userMessage.length > 4000) {
-    return message.reply({
-      content: "Please keep your message shorter so I can respond properly.",
-      allowedMentions: { repliedUser: false }
+  if (!record) {
+    return interaction.reply({
+      content: "This channel is not recognised as a ticket.",
+      flags: MessageFlags.Ephemeral
     });
   }
 
-  await message.channel.sendTyping().catch(() => {});
+  await interaction.deferUpdate();
 
   try {
-    const response = await openai.chat.completions.create({
-      model: AI_MODEL,
-      messages: [
-        {
-          role: "system",
-          content: AI_SYSTEM_PROMPT
-        },
-        ...history,
-        {
-          role: "user",
-          content: userMessage
-        }
-      ],
-      max_completion_tokens: 600
-    });
+    const messages = await channel.messages.fetch({ limit: 100 });
 
-    const answer =
-      response.choices?.[0]?.message?.content?.trim();
+    const transcript = [...messages.values()]
+      .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+      .map(message => {
+        const timestamp = new Date(message.createdTimestamp).toISOString();
+        const attachments = [...message.attachments.values()]
+          .map(file => file.url)
+          .join(", ");
 
-    if (!answer) {
-      return message.reply({
-        content: "I couldn't generate a response just now. Please try again.",
-        allowedMentions: { repliedUser: false }
-      });
-    }
+        return [
+          `[${timestamp}] ${message.author.tag}:`,
+          message.content || "[No text content]",
+          attachments ? `Attachments: ${attachments}` : ""
+        ].filter(Boolean).join("\n");
+      })
+      .join("\n\n");
 
-    history.push(
-      { role: "user", content: userMessage },
-      { role: "assistant", content: answer }
+    const transcriptFile = new AttachmentBuilder(
+      Buffer.from(transcript || "No messages recorded.", "utf8"),
+      { name: `transcript-${channel.id}.txt` }
     );
 
-    while (history.length > MAX_HISTORY_MESSAGES) {
-      history.shift();
-    }
+    await sendLog(
+      interaction.guild,
+      [
+        "Ticket closed.",
+        `Channel: ${channel.name}`,
+        `Ticket owner: <@${record.owner}>`,
+        `Closed by: ${interaction.user}`,
+        `Category: ${TICKET_CATEGORIES[record.category]?.label || "Unknown"}`
+      ].join("\n"),
+      [transcriptFile]
+    );
 
-    const safeAnswer = answer.slice(0, 1900);
+    delete config.ticketRecords[channel.id];
+    saveJSON(CONFIG_FILE, configs);
 
-    await message.reply({
-      content: safeAnswer,
-      allowedMentions: { repliedUser: false }
+    await channel.send({
+      embeds: [
+        makeEmbed(
+          "Ticket Closed",
+          `This ticket has been closed by ${interaction.user}.\n\nA transcript has been sent to the support logs channel.`
+        )
+      ],
+      components: []
     });
 
-  } catch (error) {
-    console.error("AI chatbot error:", error);
+    await interaction.editReply({
+      content: "The ticket has been closed.",
+      embeds: [],
+      components: []
+    });
 
-    await message.reply({
-      content: "The AI assistant is temporarily unavailable. Please try again later.",
-      allowedMentions: { repliedUser: false }
+    setTimeout(async () => {
+      await channel.delete("Ticket closed").catch(console.error);
+    }, 5000);
+
+  } catch (error) {
+    console.error("Ticket closing failed:", error);
+
+    await interaction.followUp({
+      content: "The ticket could not be closed. Please check the bot's permissions and try again.",
+      flags: MessageFlags.Ephemeral
     }).catch(console.error);
   }
 }
 
 // ==========================================
+// TICKET MODERATION PANEL
+// ==========================================
+
+function createModPanel() {
+  const embed = makeEmbed(
+    "Ticket Management",
+    "Use the controls below to manage this support ticket. These controls are only available to the configured support team."
+  );
+
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("ticket_rename")
+      .setLabel("Rename")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("ticket_add_member")
+      .setLabel("Add Member")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("ticket_remove_member")
+      .setLabel("Remove Member")
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("ticket_reassign")
+      .setLabel("Reassign")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("ticket_change_category")
+      .setLabel("Change Category")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("ticket_information")
+      .setLabel("Ticket Info")
+      .setStyle(ButtonStyle.Primary)
+  );
+
+  return {
+    embeds: [embed],
+    components: [row1, row2]
+  };
+}
+
+async function openModPanel(interaction) {
+  if (!(await checkSupportPermission(interaction))) return;
+
+  const record = await getTicketRecord(interaction.channel);
+
+  if (!record) {
+    return interaction.reply({
+      content: "This channel is not recognised as a ticket.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  return interaction.reply({
+    ...createModPanel(),
+    flags: MessageFlags.Ephemeral
+  });
+}
+
+// ==========================================
+// MODERATION MODALS
+// ==========================================
+
+function createTicketModal(customId, title, fieldId, label, placeholder) {
+  const modal = new ModalBuilder()
+    .setCustomId(customId)
+    .setTitle(title);
+
+  const input = new TextInputBuilder()
+    .setCustomId(fieldId)
+    .setLabel(label)
+    .setPlaceholder(placeholder)
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMaxLength(100);
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(input)
+  );
+
+  return modal;
+}
+
+async function showTicketModal(interaction, type) {
+  if (!(await checkSupportPermission(interaction))) return;
+
+  const details = {
+    rename: [
+      "ticket_rename_modal",
+      "Rename Ticket",
+      "new_name",
+      "New channel name",
+      "Enter the new ticket channel name."
+    ],
+    add: [
+      "ticket_add_modal",
+      "Add Member",
+      "user_id",
+      "Member user ID",
+      "Enter the Discord user ID."
+    ],
+    remove: [
+      "ticket_remove_modal",
+      "Remove Member",
+      "user_id",
+      "Member user ID",
+      "Enter the Discord user ID."
+    ],
+    reassign: [
+      "ticket_reassign_modal",
+      "Reassign Ticket",
+      "user_id",
+      "New staff member user ID",
+      "Enter the new support member's Discord user ID."
+    ]
+  };
+
+  const [customId, title, fieldId, label, placeholder] = details[type];
+
+  const modal = createTicketModal(
+    `${customId}:${interaction.channel.id}`,
+    title,
+    fieldId,
+    label,
+    placeholder
+  );
+
+  await interaction.showModal(modal);
+}
+
+// ==========================================
+// TICKET MODAL SUBMISSIONS
+// ==========================================
+
+async function handleTicketModal(interaction) {
+  if (!(await checkSupportPermission(interaction))) return;
+
+  const channelId = interaction.customId.split(":")[1];
+  const channel = await interaction.guild.channels.fetch(channelId).catch(() => null);
+
+  if (!channel || channel.type !== ChannelType.GuildText) {
+    return interaction.reply({
+      content: "The ticket channel could not be found.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  const config = getConfig(interaction.guild.id);
+  const record = await getTicketRecord(channel);
+
+  if (!record) {
+    return interaction.reply({
+      content: "This channel is not recognised as a ticket.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  const value = interaction.fields.getTextInputValue(
+    interaction.customId.startsWith("ticket_rename_modal")
+      ? "new_name"
+      : "user_id"
+  ).trim();
+
+  if (interaction.customId.startsWith("ticket_rename_modal")) {
+    const safeName = value
+      .toLowerCase()
+      .replace(/[^a-z0-9-]/g, "-")
+      .replace(/-+/g, "-")
+      .slice(0, 90);
+
+    if (!safeName) {
+      return interaction.reply({
+        content: "Please enter a valid channel name.",
+        flags: MessageFlags.Ephemeral
+      });
+    }
+
+    await channel.setName(safeName);
+
+    await interaction.reply({
+      content: `Ticket renamed to **${safeName}**.`,
+      flags: MessageFlags.Ephemeral
+    });
+
+    await sendLog(
+      interaction.guild,
+      `Ticket renamed to ${safeName} by ${interaction.user}.`
+    );
+
+    return;
+  }
+
+  if (!/^\d{17,20}$/.test(value)) {
+    return interaction.reply({
+      content: "That does not look like a valid Discord user ID.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  const member = await interaction.guild.members.fetch(value).catch(() => null);
+
+  if (!member) {
+    return interaction.reply({
+      content: "That member could not be found in this server.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  if (interaction.customId.startsWith("ticket_add_modal")) {
+    await channel.permissionOverwrites.edit(member.id, {
+      ViewChannel: true,
+      SendMessages: true,
+      ReadMessageHistory: true,
+      AttachFiles: true,
+      EmbedLinks: true
+    });
+
+    await interaction.reply({
+      content: `${member} has been added to the ticket.`,
+      flags: MessageFlags.Ephemeral
+    });
+
+    await sendLog(
+      interaction.guild,
+      `${member} was added to ${channel} by ${interaction.user}.`
+    );
+
+    return;
+  }
+
+  if (interaction.customId.startsWith("ticket_remove_modal")) {
+    if (member.id === record.owner) {
+      return interaction.reply({
+        content: "The ticket owner cannot be removed from their own ticket.",
+        flags: MessageFlags.Ephemeral
+      });
+    }
+
+    await channel.permissionOverwrites.delete(member.id).catch(() => {});
+
+    await interaction.reply({
+      content: `${member} has been removed from the ticket.`,
+      flags: MessageFlags.Ephemeral
+    });
+
+    await sendLog(
+      interaction.guild,
+      `${member} was removed from ${channel} by ${interaction.user}.`
+    );
+
+    return;
+  }
+
+  if (interaction.customId.startsWith("ticket_reassign_modal")) {
+    if (!config.staffRole || !member.roles.cache.has(config.staffRole)) {
+      return interaction.reply({
+        content: "The selected member is not part of the configured support team.",
+        flags: MessageFlags.Ephemeral
+      });
+    }
+
+    record.claimedBy = member.id;
+    config.ticketRecords[channel.id] = record;
+    saveJSON(CONFIG_FILE, configs);
+
+    await updateTicketEmbed(channel, record);
+
+    await interaction.reply({
+      content: `The ticket has been reassigned to ${member}.`,
+      flags: MessageFlags.Ephemeral
+    });
+
+    await sendLog(
+      interaction.guild,
+      `${channel} was reassigned to ${member} by ${interaction.user}.`
+    );
+  }
+}
+
+// ==========================================
+// CHANGE TICKET CATEGORY
+// ==========================================
+
+async function showCategoryMenu(interaction) {
+  if (!(await checkSupportPermission(interaction))) return;
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`ticket_category_change:${interaction.channel.id}`)
+    .setPlaceholder("Choose a new ticket category")
+    .addOptions(
+      Object.entries(TICKET_CATEGORIES).map(([value, category]) => ({
+        label: category.label,
+        value
+      }))
+    );
+
+  await interaction.reply({
+    content: "Select the new category for this ticket.",
+    components: [
+      new ActionRowBuilder().addComponents(menu)
+    ],
+    flags: MessageFlags.Ephemeral
+  });
+}
+
+async function changeTicketCategory(interaction) {
+  if (!(await checkSupportPermission(interaction))) return;
+
+  const channelId = interaction.customId.split(":")[1];
+  const channel = await interaction.guild.channels.fetch(channelId).catch(() => null);
+
+  if (!channel) {
+    return interaction.reply({
+      content: "Ticket channel not found.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  const config = getConfig(interaction.guild.id);
+  const record = await getTicketRecord(channel);
+  const categoryKey = interaction.values[0];
+
+  if (!record || !TICKET_CATEGORIES[categoryKey]) {
+    return interaction.reply({
+      content: "The ticket category could not be updated.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  record.category = categoryKey;
+  config.ticketRecords[channel.id] = record;
+  saveJSON(CONFIG_FILE, configs);
+
+  await channel.setName(
+    `${categoryKey}-${channel.name.split("-").slice(1).join("-") || "ticket"}`
+      .slice(0, 100)
+  );
+
+  await updateTicketEmbed(channel, record);
+
+  await interaction.update({
+    content: `Ticket category changed to **${TICKET_CATEGORIES[categoryKey].label}**.`,
+    components: []
+  });
+
+  await sendLog(
+    interaction.guild,
+    `${channel} category changed to ${TICKET_CATEGORIES[categoryKey].label} by ${interaction.user}.`
+  );
+}
+
+// ==========================================
+// TICKET INFORMATION
+// ==========================================
+
+async function showTicketInformation(interaction) {
+  if (!(await checkSupportPermission(interaction))) return;
+
+  const record = await getTicketRecord(interaction.channel);
+
+  if (!record) {
+    return interaction.reply({
+      content: "This channel is not recognised as a ticket.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  const category = TICKET_CATEGORIES[record.category];
+
+  return interaction.reply({
+    embeds: [
+      makeEmbed(
+        "Ticket Information",
+        [
+          `Channel: ${interaction.channel}`,
+          `Owner: <@${record.owner}>`,
+          `Category: ${category?.label || "Unknown"}`,
+          `Status: ${record.claimedBy ? "Claimed" : "Unclaimed"}`,
+          `Assigned staff: ${record.claimedBy ? `<@${record.claimedBy}>` : "None"}`,
+          `Opened: <t:${Math.floor(new Date(record.openedAt).getTime() / 1000)}:F>`
+        ].join("\n")
+      )
+    ],
+    flags: MessageFlags.Ephemeral
+  });
+}
+
+// ==========================================
 // SLASH COMMANDS
+// ALL COMMANDS ADMINISTRATOR ONLY
 // ==========================================
 
 const commands = [
-
   new SlashCommandBuilder()
     .setName("ping")
-    .setDescription("Check the bot response time."),
+    .setDescription("Check the bot response time.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   new SlashCommandBuilder()
     .setName("serverinfo")
-    .setDescription("View information about the server."),
+    .setDescription("View information about the server.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   new SlashCommandBuilder()
     .setName("userinfo")
     .setDescription("View information about a member.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addUserOption(option =>
       option.setName("member")
         .setDescription("The member to view.")
@@ -636,45 +1127,49 @@ const commands = [
   new SlashCommandBuilder()
     .setName("setup")
     .setDescription("Configure the ticket system.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addChannelOption(option =>
-      option.setName("ticket-category")
-        .setDescription("Discord category where tickets will be created.")
-        .addChannelTypes(ChannelType.GuildCategory)
-    )
-    .addRoleOption(option =>
-      option.setName("staff-role")
-        .setDescription("Role that can view and manage tickets.")
-    )
-    .addChannelOption(option =>
-      option.setName("logs-channel")
-        .setDescription("Channel for ticket and moderation logs.")
-        .addChannelTypes(ChannelType.GuildText)
-    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addChannelOption(option =>
       option.setName("panel-channel")
-        .setDescription("Channel where the ticket panel will be posted.")
+        .setDescription("Channel where the ticket panel will be published.")
+        .setRequired(true)
         .addChannelTypes(ChannelType.GuildText)
     )
     .addRoleOption(option =>
-      option.setName("safety-role")
-        .setDescription("Optional role notified for Safety Concerns.")
-    )
-    .addRoleOption(option =>
-      option.setName("online-role")
-        .setDescription("Optional role notified for Online Concerns.")
-    )
-    .addIntegerOption(option =>
-      option.setName("max-open-tickets")
-        .setDescription("Maximum open tickets per member.")
-        .setMinValue(1)
-        .setMaxValue(5)
+      option.setName("support-role")
+        .setDescription("Role that can view and manage support tickets.")
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("ai-setup")
+    .setDescription("Configure the AI chat channel.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addChannelOption(option =>
+      option.setName("channel")
+        .setDescription("Channel where the AI chatbot will operate.")
+        .setRequired(true)
+        .addChannelTypes(ChannelType.GuildText)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("ai-status")
+    .setDescription("View the AI chatbot status.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  new SlashCommandBuilder()
+    .setName("ai-toggle")
+    .setDescription("Enable or disable the AI chatbot.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addBooleanOption(option =>
+      option.setName("enabled")
+        .setDescription("Whether the AI chatbot should be enabled.")
+        .setRequired(true)
     ),
 
   new SlashCommandBuilder()
     .setName("warn")
     .setDescription("Issue a warning to a member.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addUserOption(option =>
       option.setName("member")
         .setDescription("Member to warn.")
@@ -689,7 +1184,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName("warnings")
     .setDescription("View a member's warnings.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addUserOption(option =>
       option.setName("member")
         .setDescription("Member to check.")
@@ -699,7 +1194,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName("clear-warnings")
     .setDescription("Clear a member's warnings.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addUserOption(option =>
       option.setName("member")
         .setDescription("Member whose warnings should be cleared.")
@@ -709,7 +1204,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName("timeout")
     .setDescription("Temporarily timeout a member.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addUserOption(option =>
       option.setName("member")
         .setDescription("Member to timeout.")
@@ -731,7 +1226,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName("untimeout")
     .setDescription("Remove a member's timeout.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addUserOption(option =>
       option.setName("member")
         .setDescription("Member to remove the timeout from.")
@@ -741,7 +1236,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName("kick")
     .setDescription("Remove a member from the server.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers)
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addUserOption(option =>
       option.setName("member")
         .setDescription("Member to kick.")
@@ -756,7 +1251,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName("ban")
     .setDescription("Ban a member from the server.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers)
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addUserOption(option =>
       option.setName("member")
         .setDescription("Member to ban.")
@@ -771,7 +1266,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName("unban")
     .setDescription("Unban a user.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers)
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addStringOption(option =>
       option.setName("user-id")
         .setDescription("Discord user ID.")
@@ -781,7 +1276,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName("purge")
     .setDescription("Delete multiple messages.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addIntegerOption(option =>
       option.setName("amount")
         .setDescription("Number of messages to delete.")
@@ -791,19 +1286,9 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
-    .setName("staff-notice")
-    .setDescription("Send a notice to the configured staff role.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addStringOption(option =>
-      option.setName("message")
-        .setDescription("Notice to send.")
-        .setRequired(true)
-    ),
-
-  new SlashCommandBuilder()
     .setName("lockdown")
     .setDescription("Lock a channel against member messages.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addChannelOption(option =>
       option.setName("channel")
         .setDescription("Channel to lock. Defaults to this channel.")
@@ -812,14 +1297,13 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("unlock")
-    .setDescription("Unlock a previously locked channel.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
+    .setDescription("Unlock a channel.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addChannelOption(option =>
       option.setName("channel")
         .setDescription("Channel to unlock. Defaults to this channel.")
         .addChannelTypes(ChannelType.GuildText)
     )
-
 ].map(command => command.toJSON());
 
 // ==========================================
@@ -829,76 +1313,243 @@ const commands = [
 async function handleSetup(interaction) {
   const config = getConfig(interaction.guild.id);
 
-  const ticketCategory = interaction.options.getChannel("ticket-category");
-  const staffRole = interaction.options.getRole("staff-role");
-  const logsChannel = interaction.options.getChannel("logs-channel");
   const panelChannel = interaction.options.getChannel("panel-channel");
-  const safetyRole = interaction.options.getRole("safety-role");
-  const onlineRole = interaction.options.getRole("online-role");
-  const maxTickets = interaction.options.getInteger("max-open-tickets");
+  const supportRole = interaction.options.getRole("support-role");
 
-  const supplied = [
-    ticketCategory,
-    staffRole,
-    logsChannel,
-    panelChannel,
-    safetyRole,
-    onlineRole,
-    maxTickets
-  ].some(Boolean);
+  config.panelChannel = panelChannel.id;
+  config.staffRole = supportRole.id;
 
-  if (!supplied) {
-    return interaction.reply({
-      content: "Provide at least one configuration option to update the ticket system.",
-      flags: MessageFlags.Ephemeral
+  await interaction.deferReply({
+    flags: MessageFlags.Ephemeral
+  });
+
+  try {
+    const { ticketCategory, logsChannel } =
+      await ensureTicketChannels(interaction.guild, config);
+
+    await panelChannel.send(createTicketPanel());
+
+    saveJSON(CONFIG_FILE, configs);
+
+    await interaction.editReply({
+      embeds: [
+        makeEmbed(
+          "Ticket System Configured",
+          [
+            `Panel channel: ${panelChannel}`,
+            `Support role: ${supportRole}`,
+            `Ticket category: ${ticketCategory}`,
+            `Support logs: ${logsChannel}`,
+            "",
+            "The ticket panel has been published successfully."
+          ].join("\n")
+        )
+      ]
+    });
+
+    await sendLog(
+      interaction.guild,
+      `Ticket system configured by ${interaction.user}.\nPanel: ${panelChannel}\nSupport role: ${supportRole}`
+    );
+
+  } catch (error) {
+    console.error("Setup failed:", error);
+
+    await interaction.editReply({
+      content: "Setup failed. Please check the bot's permissions to manage channels and send messages."
     });
   }
+}
 
-  if (ticketCategory) config.ticketCategory = ticketCategory.id;
-  if (staffRole) config.staffRole = staffRole.id;
-  if (logsChannel) config.logsChannel = logsChannel.id;
-  if (panelChannel) config.panelChannel = panelChannel.id;
-  if (safetyRole) config.safetyRole = safetyRole.id;
-  if (onlineRole) config.onlineRole = onlineRole.id;
-  if (maxTickets) config.maxOpenTickets = maxTickets;
+// ==========================================
+// AI SETUP
+// ==========================================
+
+async function handleAISetup(interaction) {
+  const config = getConfig(interaction.guild.id);
+  const channel = interaction.options.getChannel("channel");
+
+  config.aiChannel = channel.id;
+  config.aiEnabled = true;
 
   saveJSON(CONFIG_FILE, configs);
 
-  let panelStatus = "";
-
-  if (panelChannel) {
-    try {
-      await panelChannel.send(createTicketPanel());
-      panelStatus = "\nTicket panel published successfully.";
-    } catch (error) {
-      console.error(error);
-      panelStatus = "\nCould not publish the ticket panel. Check the bot's permissions.";
-    }
-  }
-
-  await interaction.reply({
+  return interaction.reply({
     embeds: [
       makeEmbed(
-        "Setup Updated",
+        "AI Chat Configured",
         [
-          `Ticket category: ${config.ticketCategory ? `<#${config.ticketCategory}>` : "Not configured"}`,
-          `Staff role: ${config.staffRole ? `<@&${config.staffRole}>` : "Not configured"}`,
-          `Logs channel: ${config.logsChannel ? `<#${config.logsChannel}>` : "Not configured"}`,
-          `Panel channel: ${config.panelChannel ? `<#${config.panelChannel}>` : "Not configured"}`,
-          `Safety notification role: ${config.safetyRole ? `<@&${config.safetyRole}>` : "Not configured"}`,
-          `Online notification role: ${config.onlineRole ? `<@&${config.onlineRole}>` : "Not configured"}`,
-          `Maximum open tickets: ${config.maxOpenTickets}`,
-          panelStatus
+          `AI channel: ${channel}`,
+          "AI chatbot: Enabled",
+          "",
+          "The AI chatbot will now respond to messages in the selected channel."
         ].join("\n")
       )
     ],
     flags: MessageFlags.Ephemeral
   });
+}
 
-  await sendLog(
-    interaction.guild,
-    `Ticket configuration updated by ${interaction.user.tag}.`
-  );
+// ==========================================
+// AI STATUS AND TOGGLE
+// ==========================================
+
+async function handleAIStatus(interaction) {
+  const config = getConfig(interaction.guild.id);
+
+  return interaction.reply({
+    embeds: [
+      makeEmbed(
+        "AI Chat Status",
+        [
+          `Channel: ${config.aiChannel ? `<#${config.aiChannel}>` : "Not configured"}`,
+          `Status: ${config.aiEnabled ? "Enabled" : "Disabled"}`,
+          `OpenAI connection: ${openai ? "API key configured" : "API key missing"}`
+        ].join("\n")
+      )
+    ],
+    flags: MessageFlags.Ephemeral
+  });
+}
+
+async function handleAIToggle(interaction) {
+  const config = getConfig(interaction.guild.id);
+  config.aiEnabled = interaction.options.getBoolean("enabled");
+
+  saveJSON(CONFIG_FILE, configs);
+
+  return interaction.reply({
+    embeds: [
+      makeEmbed(
+        "AI Chat Updated",
+        `The AI chatbot has been ${config.aiEnabled ? "enabled" : "disabled"}.`
+      )
+    ],
+    flags: MessageFlags.Ephemeral
+  });
+}
+
+// ==========================================
+// AI CHAT
+// ==========================================
+
+const aiConversations = new Map();
+const aiCooldowns = new Map();
+
+const AI_SYSTEM_PROMPT = `
+You are Safeguarding Assistant, the AI chatbot for The Safeguarding Network.
+
+The Safeguarding Network is an independent online community. It is not an official safeguarding authority, emergency service or professional counselling service.
+
+Your responsibilities:
+- Provide clear, friendly and general information.
+- Explain general safeguarding and online safety concepts.
+- Encourage people to speak to an appropriate trusted adult or qualified professional when necessary.
+- Be respectful, calm and non-judgemental.
+- Protect people's privacy.
+
+Important boundaries:
+- Do not claim to be a professional safeguarding worker.
+- Do not diagnose people or make professional assessments.
+- Do not promise confidentiality.
+- Do not claim that you have reported or escalated a concern.
+- Do not request passwords, addresses, phone numbers or unnecessary identifying information.
+- Do not encourage anyone to investigate a concern themselves or confront someone they are worried about.
+- Do not provide instructions for harmful, illegal or dangerous activities.
+- Do not provide graphic descriptions of violence, abuse or self-harm.
+- If someone describes immediate danger in the UK, tell them to call 999.
+- For non-emergency concerns, encourage them to contact an appropriate trusted adult or professional service.
+- Make it clear that this chatbot is not a replacement for real-world support.
+
+Keep replies reasonably concise and easy to understand.
+`;
+
+async function handleAIMessage(message) {
+  if (message.author.bot || !message.guild) return;
+
+  const config = getConfig(message.guild.id);
+
+  if (
+    !config.aiEnabled ||
+    !config.aiChannel ||
+    message.channel.id !== config.aiChannel
+  ) {
+    return;
+  }
+
+  if (!openai) {
+    return message.reply(
+      "The AI service is not currently configured. Please contact a server administrator."
+    );
+  }
+
+  const cooldownKey = `${message.guild.id}:${message.author.id}`;
+  const now = Date.now();
+  const lastMessage = aiCooldowns.get(cooldownKey) || 0;
+
+  if (now - lastMessage < 4000) return;
+
+  aiCooldowns.set(cooldownKey, now);
+
+  const conversationKey = `${message.guild.id}:${message.author.id}`;
+
+  if (!aiConversations.has(conversationKey)) {
+    aiConversations.set(conversationKey, []);
+  }
+
+  const history = aiConversations.get(conversationKey);
+
+  history.push({
+    role: "user",
+    content: message.content.slice(0, 3000)
+  });
+
+  if (history.length > 12) {
+    history.splice(0, history.length - 12);
+  }
+
+  await message.channel.sendTyping();
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      messages: [
+        {
+          role: "system",
+          content: AI_SYSTEM_PROMPT
+        },
+        ...history
+      ],
+      max_completion_tokens: 600
+    });
+
+    const answer =
+      response.choices[0]?.message?.content ||
+      "I'm sorry, I couldn't generate a response just now.";
+
+    history.push({
+      role: "assistant",
+      content: answer
+    });
+
+    if (history.length > 12) {
+      history.splice(0, history.length - 12);
+    }
+
+    await message.reply({
+      content: answer.slice(0, 1900),
+      allowedMentions: {
+        parse: []
+      }
+    });
+
+  } catch (error) {
+    console.error("AI response failed:", error);
+
+    await message.reply(
+      "I'm having trouble responding at the moment. Please try again later."
+    ).catch(console.error);
+  }
 }
 
 // ==========================================
@@ -907,6 +1558,14 @@ async function handleSetup(interaction) {
 
 async function handleCommand(interaction) {
   const { commandName, guild } = interaction;
+
+  // Extra protection: all slash commands are admin-only.
+  if (!isAdmin(interaction)) {
+    return interaction.reply({
+      content: "Only server administrators can use slash commands.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
 
   if (commandName === "ping") {
     return interaction.reply({
@@ -956,6 +1615,18 @@ async function handleCommand(interaction) {
 
   if (commandName === "setup") {
     return handleSetup(interaction);
+  }
+
+  if (commandName === "ai-setup") {
+    return handleAISetup(interaction);
+  }
+
+  if (commandName === "ai-status") {
+    return handleAIStatus(interaction);
+  }
+
+  if (commandName === "ai-toggle") {
+    return handleAIToggle(interaction);
   }
 
   if (commandName === "warn") {
@@ -1046,6 +1717,7 @@ async function handleCommand(interaction) {
     const reason = interaction.options.getString("reason");
 
     const target = await guild.members.fetch(user.id);
+
     await target.timeout(minutes * 60 * 1000, reason);
 
     await interaction.reply({
@@ -1168,33 +1840,6 @@ async function handleCommand(interaction) {
     });
   }
 
-  if (commandName === "staff-notice") {
-    const config = getConfig(guild.id);
-    const message = interaction.options.getString("message");
-
-    if (!config.staffRole) {
-      return interaction.reply({
-        content: "No staff role has been configured. Use /setup first.",
-        flags: MessageFlags.Ephemeral
-      });
-    }
-
-    await interaction.channel.send({
-      content: `<@&${config.staffRole}>`,
-      allowedMentions: {
-        roles: [config.staffRole]
-      },
-      embeds: [
-        makeEmbed("Staff Notice", message)
-      ]
-    });
-
-    return interaction.reply({
-      content: "Staff notice published.",
-      flags: MessageFlags.Ephemeral
-    });
-  }
-
   if (commandName === "lockdown" || commandName === "unlock") {
     const channel =
       interaction.options.getChannel("channel") || interaction.channel;
@@ -1242,11 +1887,64 @@ client.on("interactionCreate", async interaction => {
       return await createTicket(interaction, interaction.values[0]);
     }
 
+    if (interaction.isButton()) {
+      switch (interaction.customId) {
+        case "ticket_claim":
+          return await claimTicket(interaction);
+
+        case "ticket_close":
+          return await requestTicketClose(interaction);
+
+        case "ticket_close_confirm":
+          return await finishTicketClose(interaction);
+
+        case "ticket_close_cancel":
+          return await interaction.update({
+            content: "Ticket closing cancelled.",
+            embeds: [],
+            components: []
+          });
+
+        case "ticket_modpanel":
+          return await openModPanel(interaction);
+
+        case "ticket_rename":
+          return await showTicketModal(interaction, "rename");
+
+        case "ticket_add_member":
+          return await showTicketModal(interaction, "add");
+
+        case "ticket_remove_member":
+          return await showTicketModal(interaction, "remove");
+
+        case "ticket_reassign":
+          return await showTicketModal(interaction, "reassign");
+
+        case "ticket_change_category":
+          return await showCategoryMenu(interaction);
+
+        case "ticket_information":
+          return await showTicketInformation(interaction);
+      }
+    }
+
     if (
-      interaction.isButton() &&
-      interaction.customId === "ticket_close"
+      interaction.isStringSelectMenu() &&
+      interaction.customId.startsWith("ticket_category_change:")
     ) {
-      return await closeTicket(interaction);
+      return await changeTicketCategory(interaction);
+    }
+
+    if (
+      interaction.isModalSubmit() &&
+      (
+        interaction.customId.startsWith("ticket_rename_modal:") ||
+        interaction.customId.startsWith("ticket_add_modal:") ||
+        interaction.customId.startsWith("ticket_remove_modal:") ||
+        interaction.customId.startsWith("ticket_reassign_modal:")
+      )
+    ) {
+      return await handleTicketModal(interaction);
     }
 
   } catch (error) {
@@ -1266,14 +1964,14 @@ client.on("interactionCreate", async interaction => {
 });
 
 // ==========================================
-// MESSAGE EVENTS - AI CHAT
+// AI MESSAGE EVENT
 // ==========================================
 
 client.on("messageCreate", async message => {
   try {
     await handleAIMessage(message);
   } catch (error) {
-    console.error("Message handler error:", error);
+    console.error("AI message handler error:", error);
   }
 });
 
@@ -1285,14 +1983,6 @@ client.once("clientReady", async readyClient => {
   console.log(
     `Safeguarding Assistant is online as ${readyClient.user.tag}.`
   );
-
-  if (!openai) {
-    console.log("AI chatbot disabled: OPENAI_API_KEY is missing.");
-  } else if (!AI_CHAT_CHANNEL_ID) {
-    console.log("AI chatbot disabled: AI_CHAT_CHANNEL_ID is missing.");
-  } else {
-    console.log(`AI chatbot enabled in channel ${AI_CHAT_CHANNEL_ID}.`);
-  }
 
   try {
     const rest = new REST({ version: "10" }).setToken(TOKEN);
