@@ -1640,7 +1640,9 @@ async function handleAIStatus(interaction) {
         [
           `Channel: ${config.aiChannel ? `<#${config.aiChannel}>` : "Not configured"}`,
           `Status: ${config.aiEnabled ? "Enabled" : "Disabled"}`,
-          `OpenAI connection: ${openai ? "API key configured" : "API key missing"}`
+          `OpenAI connection: ${openai ? "API key configured" : "API key missing"}`,
+          "Response limit: No bot-imposed limit",
+          "Cooldown: Disabled"
         ].join("\n")
       )
     ],
@@ -1668,10 +1670,11 @@ async function handleAIToggle(interaction) {
 
 // ==========================================
 // AI CHAT
+// NO ARTIFICIAL RESPONSE COUNT OR COOLDOWN
 // ==========================================
 
 const aiConversations = new Map();
-const aiCooldowns = new Map();
+const aiQueues = new Map();
 
 const AI_SYSTEM_PROMPT = `
 You are Safeguarding Assistant, the AI chatbot for The Safeguarding Network.
@@ -1701,7 +1704,32 @@ Important boundaries:
 Keep replies reasonably concise and easy to understand.
 `;
 
-async function handleAIMessage(message) {
+function splitAIResponse(text, maxLength = 1900) {
+  const chunks = [];
+
+  while (text.length > maxLength) {
+    let splitAt = text.lastIndexOf("\n", maxLength);
+
+    if (splitAt < maxLength * 0.5) {
+      splitAt = text.lastIndexOf(" ", maxLength);
+    }
+
+    if (splitAt < maxLength * 0.5) {
+      splitAt = maxLength;
+    }
+
+    chunks.push(text.slice(0, splitAt).trim());
+    text = text.slice(splitAt).trim();
+  }
+
+  if (text.length > 0) {
+    chunks.push(text);
+  }
+
+  return chunks;
+}
+
+async function processAIMessage(message) {
   if (message.author.bot || !message.guild) return;
 
   const config = getConfig(message.guild.id);
@@ -1715,20 +1743,14 @@ async function handleAIMessage(message) {
   }
 
   if (!openai) {
-    return message.reply(
+    await message.reply(
       "The AI service is not currently configured. Please contact a server administrator."
     );
+    return;
   }
 
-  const cooldownKey = `${message.guild.id}:${message.author.id}`;
-  const now = Date.now();
-  const lastMessage = aiCooldowns.get(cooldownKey) || 0;
-
-  if (now - lastMessage < 4000) return;
-
-  aiCooldowns.set(cooldownKey, now);
-
-  const conversationKey = `${message.guild.id}:${message.author.id}`;
+  const conversationKey =
+    `${message.guild.id}:${message.author.id}`;
 
   if (!aiConversations.has(conversationKey)) {
     aiConversations.set(conversationKey, []);
@@ -1738,11 +1760,12 @@ async function handleAIMessage(message) {
 
   history.push({
     role: "user",
-    content: message.content.slice(0, 3000)
+    content: message.content.slice(0, 6000)
   });
 
-  if (history.length > 12) {
-    history.splice(0, history.length - 12);
+  // Retain recent context without imposing a response-count limit.
+  if (history.length > 20) {
+    history.splice(0, history.length - 20);
   }
 
   await message.channel.sendTyping();
@@ -1757,35 +1780,87 @@ async function handleAIMessage(message) {
         },
         ...history
       ],
-      max_completion_tokens: 600
+      max_completion_tokens: 2000
     });
 
     const answer =
-      response.choices[0]?.message?.content ||
-      "I'm sorry, I couldn't generate a response just now.";
+      response.choices[0]?.message?.content?.trim();
+
+    if (!answer) {
+      throw new Error("OpenAI returned an empty response.");
+    }
 
     history.push({
       role: "assistant",
       content: answer
     });
 
-    if (history.length > 12) {
-      history.splice(0, history.length - 12);
+    if (history.length > 20) {
+      history.splice(0, history.length - 20);
     }
 
-    await message.reply({
-      content: answer.slice(0, 1900),
-      allowedMentions: {
-        parse: []
+    const chunks = splitAIResponse(answer);
+
+    for (let i = 0; i < chunks.length; i++) {
+      if (i === 0) {
+        await message.reply({
+          content: chunks[i],
+          allowedMentions: {
+            parse: []
+          }
+        });
+      } else {
+        await message.channel.send({
+          content: chunks[i],
+          allowedMentions: {
+            parse: []
+          }
+        });
       }
-    });
+    }
 
   } catch (error) {
-    console.error("AI response failed:", error);
+    console.error("AI RESPONSE ERROR:", error);
+    console.error("OpenAI error status:", error.status || "Unknown");
+    console.error("OpenAI error code:", error.code || "Unknown");
 
     await message.reply(
       "I'm having trouble responding at the moment. Please try again later."
     ).catch(console.error);
+  }
+}
+
+async function handleAIMessage(message) {
+  if (message.author.bot || !message.guild) return;
+
+  const config = getConfig(message.guild.id);
+
+  if (
+    !config.aiEnabled ||
+    !config.aiChannel ||
+    message.channel.id !== config.aiChannel
+  ) {
+    return;
+  }
+
+  const queueKey =
+    `${message.guild.id}:${message.author.id}`;
+
+  const previousTask =
+    aiQueues.get(queueKey) || Promise.resolve();
+
+  const currentTask = previousTask
+    .catch(() => {})
+    .then(() => processAIMessage(message));
+
+  aiQueues.set(queueKey, currentTask);
+
+  try {
+    await currentTask;
+  } finally {
+    if (aiQueues.get(queueKey) === currentTask) {
+      aiQueues.delete(queueKey);
+    }
   }
 }
 
@@ -2241,6 +2316,7 @@ async function startBot() {
   console.log(`Application ID: ${CLIENT_ID}`);
   console.log(`Server ID: ${GUILD_ID}`);
   console.log(`Commands prepared: ${commands.length}`);
+  console.log(`OpenAI configured: ${openai ? "Yes" : "No"}`);
 
   try {
     const rest = new REST({ version: "10" }).setToken(TOKEN);
