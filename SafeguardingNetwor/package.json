@@ -1,1 +1,15 @@
 
+{
+  "name": "safeguarding-assistant",
+  "version": "1.0.0",
+  "description": "The official Discord bot for The Safeguarding Network.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.19.3",
+    "dotenv": "^16.4.7"
+  }
+}
+
