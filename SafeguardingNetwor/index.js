@@ -3,6 +3,7 @@ require("dotenv").config();
 
 const fs = require("node:fs");
 const path = require("node:path");
+const OpenAI = require("openai");
 
 const {
   Client,
@@ -28,11 +29,18 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const GUILD_ID = process.env.DISCORD_GUILD_ID;
 
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const AI_CHAT_CHANNEL_ID = process.env.AI_CHAT_CHANNEL_ID;
+
 if (!TOKEN || !CLIENT_ID || !GUILD_ID) {
   throw new Error(
     "Missing DISCORD_TOKEN, DISCORD_CLIENT_ID or DISCORD_GUILD_ID."
   );
 }
+
+const openai = OPENAI_API_KEY
+  ? new OpenAI({ apiKey: OPENAI_API_KEY })
+  : null;
 
 const DATA_DIR = path.join(__dirname, "data");
 const CONFIG_FILE = path.join(DATA_DIR, "guilds.json");
@@ -79,12 +87,15 @@ function getConfig(guildId) {
 // CLIENT
 // ==========================================
 
-// GuildMembers has been removed to prevent
-// the "Used disallowed intents" error.
+// GuildMembers is deliberately NOT enabled.
+// MessageContent must be enabled in the
+// Discord Developer Portal for AI chat.
 
 const client = new Client({
   intents: [
-    GatewayIntentBits.Guilds
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
   ]
 });
 
@@ -190,42 +201,28 @@ async function sendLog(guild, description) {
 
 function createTicketPanel() {
   const embed = makeEmbed(
-    "TSN | Support Centre",
+    "The Safeguarding Network Support Centre",
     [
-      "Welcome to The Safeguarding Network Support Centre.",
+      "> Welcome to The Safeguarding Network Support Centre, If you require assistance, have an enquiry or wish to raise a concern, select the most appropriate category below.",
       "",
-      "If you require assistance, have an enquiry or wish to raise a concern, select the most appropriate category below.",
+      "__**Available Support Categories**__",
       "",
-      "**Available Support Categories**",
+      "> • General Enquiries",
+      "> • Personal Support",
+      "> • Safety Concerns",
+      "> • Online Concerns",
+      "> • Further Assistance",
+      "> • Report a User",
+      "> • Staffing Enquiries",
       "",
-      "**General Enquiries**",
-      "General questions and enquiries about TSN.",
+      "__**Before opening a ticket**__",
       "",
-      "**Personal Support**",
-      "Request assistance with a personal matter.",
+      "> • Select the category most relevant to your enquiry.",
+      "> • Treat staff members respectfully.",
+      "> • Only share information relevant to your enquiry.",
+      "> • Tickets are private to the member and authorised staff, but are not guaranteed confidential.",
       "",
-      "**Safety Concerns**",
-      "Raise concerns relating to someone's safety or wellbeing.",
-      "",
-      "**Online Concerns**",
-      "Raise concerns about online safety and digital interactions.",
-      "",
-      "**Further Assistance**",
-      "For matters that do not fit another category.",
-      "",
-      "**Report a User**",
-      "Report a member to the TSN staff team.",
-      "",
-      "**Staffing Enquiries**",
-      "Questions about staffing and staff opportunities.",
-      "",
-      "**Before opening a ticket**",
-      "- Select the category most relevant to your enquiry.",
-      "- Treat staff members respectfully.",
-      "- Only share information relevant to your enquiry.",
-      "- Tickets are private to the member and authorised staff, but are not guaranteed confidential.",
-      "",
-      "The Safeguarding Network is an independent community. This ticket system does not replace professional safeguarding services or emergency assistance.",
+      "> The Safeguarding Network is an independent community. This ticket system does not replace professional safeguarding services or emergency assistance.",
       "",
       "**Select a support category below to get started.**"
     ].join("\n")
@@ -356,7 +353,6 @@ async function createTicket(interaction, categoryKey) {
       }
     ];
 
-    // Give the additional notification role access too.
     if (
       notificationRole.id !== staffRole.id &&
       notificationRole.id !== guild.roles.everyone.id
@@ -441,6 +437,7 @@ async function closeTicket(interaction) {
   const isOwner = interaction.user.id === ownerId;
 
   const member = await guild.members.fetch(interaction.user.id);
+
   const isStaff = config.staffRole
     ? member.roles.cache.has(config.staffRole)
     : false;
@@ -474,6 +471,143 @@ async function closeTicket(interaction) {
   setTimeout(async () => {
     await channel.delete("Ticket closed").catch(console.error);
   }, 5000);
+}
+
+// ==========================================
+// AI CHATBOT
+// ==========================================
+
+// Conversation history is held temporarily in memory.
+// It is not written to the bot's JSON files.
+
+const aiConversations = new Map();
+const aiCooldowns = new Map();
+
+const AI_MODEL = "gpt-4.1-mini";
+const MAX_HISTORY_MESSAGES = 10;
+const AI_COOLDOWN_MS = 4000;
+
+const AI_SYSTEM_PROMPT = `
+You are Safeguarding Assistant's AI chatbot in The Safeguarding Network (TSN).
+
+Your purpose is to provide friendly, clear and useful general information
+and answer everyday questions.
+
+IMPORTANT GUIDELINES:
+
+1. You are an AI assistant, not a human staff member.
+2. You are not a professional safeguarding service, emergency service,
+   therapist, doctor, lawyer or official authority.
+3. Never claim to investigate, report, escalate or contact anyone.
+4. Do not promise confidentiality or secrecy.
+5. Do not ask users for passwords, addresses, phone numbers or unnecessary
+   identifying information.
+6. Do not encourage users to share sensitive personal information in
+   a public Discord channel.
+7. If someone describes immediate danger in the UK, advise them to call 999.
+   If they are unsure what to do, encourage them to speak to a trusted adult
+   or appropriate professional.
+8. For safeguarding concerns, encourage users to contact an appropriate
+   trusted adult or professional service. Do not attempt to investigate.
+9. Respond calmly and supportively to distressing topics.
+10. Do not provide instructions that facilitate harm, abuse, exploitation
+    or dangerous behaviour.
+11. Do not invent facts, policies, server rules or staff decisions.
+12. Explain when you are uncertain.
+13. Keep answers reasonably concise and easy to understand.
+14. Do not claim to represent an official safeguarding authority.
+
+The Safeguarding Network is an independent community.
+`;
+
+// ==========================================
+// AI MESSAGE HANDLER
+// ==========================================
+
+async function handleAIMessage(message) {
+  if (!openai || !AI_CHAT_CHANNEL_ID) return;
+  if (message.author.bot || !message.guild) return;
+  if (message.channel.id !== AI_CHAT_CHANNEL_ID) return;
+
+  const now = Date.now();
+  const lastMessage = aiCooldowns.get(message.author.id) || 0;
+
+  if (now - lastMessage < AI_COOLDOWN_MS) return;
+
+  aiCooldowns.set(message.author.id, now);
+
+  const conversationKey = `${message.guild.id}:${message.author.id}`;
+
+  if (!aiConversations.has(conversationKey)) {
+    aiConversations.set(conversationKey, []);
+  }
+
+  const history = aiConversations.get(conversationKey);
+
+  const userMessage = message.content.trim();
+
+  if (!userMessage) return;
+
+  if (userMessage.length > 4000) {
+    return message.reply({
+      content: "Please keep your message shorter so I can respond properly.",
+      allowedMentions: { repliedUser: false }
+    });
+  }
+
+  await message.channel.sendTyping().catch(() => {});
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: AI_MODEL,
+      messages: [
+        {
+          role: "system",
+          content: AI_SYSTEM_PROMPT
+        },
+        ...history,
+        {
+          role: "user",
+          content: userMessage
+        }
+      ],
+      max_completion_tokens: 600
+    });
+
+    const answer =
+      response.choices?.[0]?.message?.content?.trim();
+
+    if (!answer) {
+      return message.reply({
+        content: "I couldn't generate a response just now. Please try again.",
+        allowedMentions: { repliedUser: false }
+      });
+    }
+
+    history.push(
+      { role: "user", content: userMessage },
+      { role: "assistant", content: answer }
+    );
+
+    while (history.length > MAX_HISTORY_MESSAGES) {
+      history.shift();
+    }
+
+    const safeAnswer = answer.slice(0, 1900);
+
+    await message.reply({
+      content: safeAnswer,
+      allowedMentions: { repliedUser: false }
+    });
+
+  } catch (error) {
+    console.error("AI chatbot error:", error);
+
+    await message.reply({
+      content: "The AI assistant is temporarily unavailable. Please try again later.",
+      allowedMentions: { repliedUser: false }
+    }).catch(console.error);
+  }
 }
 
 // ==========================================
@@ -657,27 +791,6 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
-    .setName("announce")
-    .setDescription("Publish a server announcement.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addChannelOption(option =>
-      option.setName("channel")
-        .setDescription("Channel to publish the announcement in.")
-        .setRequired(true)
-        .addChannelTypes(ChannelType.GuildText)
-    )
-    .addStringOption(option =>
-      option.setName("title")
-        .setDescription("Announcement title.")
-        .setRequired(true)
-    )
-    .addStringOption(option =>
-      option.setName("message")
-        .setDescription("Announcement message.")
-        .setRequired(true)
-    ),
-
-  new SlashCommandBuilder()
     .setName("staff-notice")
     .setDescription("Send a notice to the configured staff role.")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
@@ -798,10 +911,7 @@ async function handleCommand(interaction) {
   if (commandName === "ping") {
     return interaction.reply({
       embeds: [
-        makeEmbed(
-          "Pong",
-          `Response time: ${client.ws.ping}ms`
-        )
+        makeEmbed("Pong", `Response time: ${client.ws.ping}ms`)
       ],
       flags: MessageFlags.Ephemeral
     });
@@ -936,7 +1046,6 @@ async function handleCommand(interaction) {
     const reason = interaction.options.getString("reason");
 
     const target = await guild.members.fetch(user.id);
-
     await target.timeout(minutes * 60 * 1000, reason);
 
     await interaction.reply({
@@ -1059,21 +1168,6 @@ async function handleCommand(interaction) {
     });
   }
 
-  if (commandName === "announce") {
-    const channel = interaction.options.getChannel("channel");
-    const title = interaction.options.getString("title");
-    const message = interaction.options.getString("message");
-
-    await channel.send({
-      embeds: [makeEmbed(title, message)]
-    });
-
-    return interaction.reply({
-      content: "Announcement published successfully.",
-      flags: MessageFlags.Ephemeral
-    });
-  }
-
   if (commandName === "staff-notice") {
     const config = getConfig(guild.id);
     const message = interaction.options.getString("message");
@@ -1172,6 +1266,18 @@ client.on("interactionCreate", async interaction => {
 });
 
 // ==========================================
+// MESSAGE EVENTS - AI CHAT
+// ==========================================
+
+client.on("messageCreate", async message => {
+  try {
+    await handleAIMessage(message);
+  } catch (error) {
+    console.error("Message handler error:", error);
+  }
+});
+
+// ==========================================
 // READY EVENT
 // ==========================================
 
@@ -1179,6 +1285,14 @@ client.once("clientReady", async readyClient => {
   console.log(
     `Safeguarding Assistant is online as ${readyClient.user.tag}.`
   );
+
+  if (!openai) {
+    console.log("AI chatbot disabled: OPENAI_API_KEY is missing.");
+  } else if (!AI_CHAT_CHANNEL_ID) {
+    console.log("AI chatbot disabled: AI_CHAT_CHANNEL_ID is missing.");
+  } else {
+    console.log(`AI chatbot enabled in channel ${AI_CHAT_CHANNEL_ID}.`);
+  }
 
   try {
     const rest = new REST({ version: "10" }).setToken(TOKEN);
