@@ -68,6 +68,7 @@ function getConfig(guildId) {
       onlineRole: null,
       maxOpenTickets: 2
     };
+
     saveJSON(CONFIG_FILE, configs);
   }
 
@@ -78,10 +79,12 @@ function getConfig(guildId) {
 // CLIENT
 // ==========================================
 
+// GuildMembers has been removed to prevent
+// the "Used disallowed intents" error.
+
 const client = new Client({
   intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers
+    GatewayIntentBits.Guilds
   ]
 });
 
@@ -169,9 +172,11 @@ const TICKET_CATEGORIES = {
 
 async function sendLog(guild, description) {
   const config = getConfig(guild.id);
+
   if (!config.logsChannel) return;
 
   const channel = guild.channels.cache.get(config.logsChannel);
+
   if (!channel || !channel.isTextBased()) return;
 
   await channel.send({
@@ -271,7 +276,11 @@ async function createTicket(interaction, categoryKey) {
   const discordCategory = guild.channels.cache.get(config.ticketCategory);
   const staffRole = guild.roles.cache.get(config.staffRole);
 
-  if (!discordCategory || !staffRole) {
+  if (
+    !discordCategory ||
+    discordCategory.type !== ChannelType.GuildCategory ||
+    !staffRole
+  ) {
     return interaction.reply({
       content: "The configured ticket category or staff role could not be found. Please contact an administrator.",
       flags: MessageFlags.Ephemeral
@@ -290,16 +299,20 @@ async function createTicket(interaction, categoryKey) {
     });
   }
 
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  await interaction.deferReply({
+    flags: MessageFlags.Ephemeral
+  });
 
   let notificationRole = staffRole;
 
   if (categoryKey === "safety" && config.safetyRole) {
-    notificationRole = guild.roles.cache.get(config.safetyRole) || staffRole;
+    notificationRole =
+      guild.roles.cache.get(config.safetyRole) || staffRole;
   }
 
   if (categoryKey === "online" && config.onlineRole) {
-    notificationRole = guild.roles.cache.get(config.onlineRole) || staffRole;
+    notificationRole =
+      guild.roles.cache.get(config.onlineRole) || staffRole;
   }
 
   const safeName = interaction.user.username
@@ -308,45 +321,62 @@ async function createTicket(interaction, categoryKey) {
     .slice(0, 15) || "member";
 
   try {
+    const permissionOverwrites = [
+      {
+        id: guild.roles.everyone.id,
+        deny: [PermissionFlagsBits.ViewChannel]
+      },
+      {
+        id: interaction.user.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.AttachFiles,
+          PermissionFlagsBits.EmbedLinks
+        ]
+      },
+      {
+        id: staffRole.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.ManageMessages
+        ]
+      },
+      {
+        id: client.user.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.ManageChannels
+        ]
+      }
+    ];
+
+    // Give the additional notification role access too.
+    if (
+      notificationRole.id !== staffRole.id &&
+      notificationRole.id !== guild.roles.everyone.id
+    ) {
+      permissionOverwrites.push({
+        id: notificationRole.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory
+        ]
+      });
+    }
+
     const channel = await guild.channels.create({
       name: `${categoryKey}-${safeName}`,
       type: ChannelType.GuildText,
       parent: discordCategory.id,
       topic: `ticket-owner:${interaction.user.id} | ticket-type:${categoryKey}`,
-      permissionOverwrites: [
-        {
-          id: guild.roles.everyone.id,
-          deny: [PermissionFlagsBits.ViewChannel]
-        },
-        {
-          id: interaction.user.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.AttachFiles,
-            PermissionFlagsBits.EmbedLinks
-          ]
-        },
-        {
-          id: staffRole.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.ManageMessages
-          ]
-        },
-        {
-          id: client.user.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.ManageChannels
-          ]
-        }
-      ]
+      permissionOverwrites
     });
 
     const embed = makeEmbed(
@@ -409,9 +439,17 @@ async function closeTicket(interaction) {
 
   const ownerId = ownerMatch[1];
   const isOwner = interaction.user.id === ownerId;
-  const isStaff = interaction.member.roles?.cache.has(config.staffRole);
 
-  if (!isOwner && !isStaff && !interaction.memberPermissions.has(PermissionFlagsBits.ManageChannels)) {
+  const member = await guild.members.fetch(interaction.user.id);
+  const isStaff = config.staffRole
+    ? member.roles.cache.has(config.staffRole)
+    : false;
+
+  const canManage = interaction.memberPermissions?.has(
+    PermissionFlagsBits.ManageChannels
+  );
+
+  if (!isOwner && !isStaff && !canManage) {
     return interaction.reply({
       content: "You do not have permission to close this ticket.",
       flags: MessageFlags.Ephemeral
@@ -668,6 +706,7 @@ const commands = [
         .setDescription("Channel to unlock. Defaults to this channel.")
         .addChannelTypes(ChannelType.GuildText)
     )
+
 ].map(command => command.toJSON());
 
 // ==========================================
@@ -743,7 +782,10 @@ async function handleSetup(interaction) {
     flags: MessageFlags.Ephemeral
   });
 
-  await sendLog(interaction.guild, `Ticket configuration updated by ${interaction.user.tag}.`);
+  await sendLog(
+    interaction.guild,
+    `Ticket configuration updated by ${interaction.user.tag}.`
+  );
 }
 
 // ==========================================
@@ -751,7 +793,7 @@ async function handleSetup(interaction) {
 // ==========================================
 
 async function handleCommand(interaction) {
-  const { commandName, guild, member } = interaction;
+  const { commandName, guild } = interaction;
 
   if (commandName === "ping") {
     return interaction.reply({
@@ -822,15 +864,28 @@ async function handleCommand(interaction) {
     saveJSON(WARNINGS_FILE, warnings);
 
     await user.send({
-      embeds: [makeEmbed("You Have Received a Warning", `Server: ${guild.name}\nReason: ${reason}`)]
+      embeds: [
+        makeEmbed(
+          "You Have Received a Warning",
+          `Server: ${guild.name}\nReason: ${reason}`
+        )
+      ]
     }).catch(() => {});
 
     await interaction.reply({
-      embeds: [makeEmbed("Warning Issued", `${user} has received a warning.\nReason: ${reason}`)],
+      embeds: [
+        makeEmbed(
+          "Warning Issued",
+          `${user} has received a warning.\nReason: ${reason}`
+        )
+      ],
       flags: MessageFlags.Ephemeral
     });
 
-    return sendLog(guild, `${user.tag} was warned by ${interaction.user.tag}.\nReason: ${reason}`);
+    return sendLog(
+      guild,
+      `${user.tag} was warned by ${interaction.user.tag}.\nReason: ${reason}`
+    );
   }
 
   if (commandName === "warnings") {
@@ -844,7 +899,9 @@ async function handleCommand(interaction) {
       : "This member has no recorded warnings.";
 
     return interaction.reply({
-      embeds: [makeEmbed(`Warnings: ${user.tag}`, description)],
+      embeds: [
+        makeEmbed(`Warnings: ${user.tag}`, description)
+      ],
       flags: MessageFlags.Ephemeral
     });
   }
@@ -858,11 +915,19 @@ async function handleCommand(interaction) {
     }
 
     await interaction.reply({
-      embeds: [makeEmbed("Warnings Cleared", `Warnings for ${user} have been cleared.`)],
+      embeds: [
+        makeEmbed(
+          "Warnings Cleared",
+          `Warnings for ${user} have been cleared.`
+        )
+      ],
       flags: MessageFlags.Ephemeral
     });
 
-    return sendLog(guild, `Warnings cleared for ${user.tag} by ${interaction.user.tag}.`);
+    return sendLog(
+      guild,
+      `Warnings cleared for ${user.tag} by ${interaction.user.tag}.`
+    );
   }
 
   if (commandName === "timeout") {
@@ -875,11 +940,19 @@ async function handleCommand(interaction) {
     await target.timeout(minutes * 60 * 1000, reason);
 
     await interaction.reply({
-      embeds: [makeEmbed("Member Timed Out", `${user} has been timed out for ${minutes} minutes.\nReason: ${reason}`)],
+      embeds: [
+        makeEmbed(
+          "Member Timed Out",
+          `${user} has been timed out for ${minutes} minutes.\nReason: ${reason}`
+        )
+      ],
       flags: MessageFlags.Ephemeral
     });
 
-    return sendLog(guild, `${user.tag} was timed out by ${interaction.user.tag} for ${minutes} minutes.\nReason: ${reason}`);
+    return sendLog(
+      guild,
+      `${user.tag} was timed out by ${interaction.user.tag} for ${minutes} minutes.\nReason: ${reason}`
+    );
   }
 
   if (commandName === "untimeout") {
@@ -889,11 +962,19 @@ async function handleCommand(interaction) {
     await target.timeout(null);
 
     await interaction.reply({
-      embeds: [makeEmbed("Timeout Removed", `The timeout for ${user} has been removed.`)],
+      embeds: [
+        makeEmbed(
+          "Timeout Removed",
+          `The timeout for ${user} has been removed.`
+        )
+      ],
       flags: MessageFlags.Ephemeral
     });
 
-    return sendLog(guild, `Timeout removed from ${user.tag} by ${interaction.user.tag}.`);
+    return sendLog(
+      guild,
+      `Timeout removed from ${user.tag} by ${interaction.user.tag}.`
+    );
   }
 
   if (commandName === "kick") {
@@ -904,11 +985,19 @@ async function handleCommand(interaction) {
     await target.kick(reason);
 
     await interaction.reply({
-      embeds: [makeEmbed("Member Kicked", `${user.tag} has been removed.\nReason: ${reason}`)],
+      embeds: [
+        makeEmbed(
+          "Member Kicked",
+          `${user.tag} has been removed.\nReason: ${reason}`
+        )
+      ],
       flags: MessageFlags.Ephemeral
     });
 
-    return sendLog(guild, `${user.tag} was kicked by ${interaction.user.tag}.\nReason: ${reason}`);
+    return sendLog(
+      guild,
+      `${user.tag} was kicked by ${interaction.user.tag}.\nReason: ${reason}`
+    );
   }
 
   if (commandName === "ban") {
@@ -918,11 +1007,19 @@ async function handleCommand(interaction) {
     await guild.members.ban(user.id, { reason });
 
     await interaction.reply({
-      embeds: [makeEmbed("Member Banned", `${user.tag} has been banned.\nReason: ${reason}`)],
+      embeds: [
+        makeEmbed(
+          "Member Banned",
+          `${user.tag} has been banned.\nReason: ${reason}`
+        )
+      ],
       flags: MessageFlags.Ephemeral
     });
 
-    return sendLog(guild, `${user.tag} was banned by ${interaction.user.tag}.\nReason: ${reason}`);
+    return sendLog(
+      guild,
+      `${user.tag} was banned by ${interaction.user.tag}.\nReason: ${reason}`
+    );
   }
 
   if (commandName === "unban") {
@@ -931,11 +1028,19 @@ async function handleCommand(interaction) {
     await guild.members.unban(userId);
 
     await interaction.reply({
-      embeds: [makeEmbed("User Unbanned", `User ${userId} has been unbanned.`)],
+      embeds: [
+        makeEmbed(
+          "User Unbanned",
+          `User ${userId} has been unbanned.`
+        )
+      ],
       flags: MessageFlags.Ephemeral
     });
 
-    return sendLog(guild, `User ${userId} was unbanned by ${interaction.user.tag}.`);
+    return sendLog(
+      guild,
+      `User ${userId} was unbanned by ${interaction.user.tag}.`
+    );
   }
 
   if (commandName === "purge") {
@@ -944,7 +1049,12 @@ async function handleCommand(interaction) {
     const deleted = await interaction.channel.bulkDelete(amount, true);
 
     return interaction.reply({
-      embeds: [makeEmbed("Messages Deleted", `${deleted.size} messages were deleted.`)],
+      embeds: [
+        makeEmbed(
+          "Messages Deleted",
+          `${deleted.size} messages were deleted.`
+        )
+      ],
       flags: MessageFlags.Ephemeral
     });
   }
@@ -977,8 +1087,12 @@ async function handleCommand(interaction) {
 
     await interaction.channel.send({
       content: `<@&${config.staffRole}>`,
-      allowedMentions: { roles: [config.staffRole] },
-      embeds: [makeEmbed("Staff Notice", message)]
+      allowedMentions: {
+        roles: [config.staffRole]
+      },
+      embeds: [
+        makeEmbed("Staff Notice", message)
+      ]
     });
 
     return interaction.reply({
@@ -988,7 +1102,9 @@ async function handleCommand(interaction) {
   }
 
   if (commandName === "lockdown" || commandName === "unlock") {
-    const channel = interaction.options.getChannel("channel") || interaction.channel;
+    const channel =
+      interaction.options.getChannel("channel") || interaction.channel;
+
     const locked = commandName === "lockdown";
 
     await channel.permissionOverwrites.edit(
@@ -1008,7 +1124,10 @@ async function handleCommand(interaction) {
       flags: MessageFlags.Ephemeral
     });
 
-    return sendLog(guild, `${channel.name} was ${locked ? "locked" : "unlocked"} by ${interaction.user.tag}.`);
+    return sendLog(
+      guild,
+      `${channel.name} was ${locked ? "locked" : "unlocked"} by ${interaction.user.tag}.`
+    );
   }
 }
 
@@ -1022,11 +1141,17 @@ client.on("interactionCreate", async interaction => {
       return await handleCommand(interaction);
     }
 
-    if (interaction.isStringSelectMenu() && interaction.customId === "ticket_select") {
+    if (
+      interaction.isStringSelectMenu() &&
+      interaction.customId === "ticket_select"
+    ) {
       return await createTicket(interaction, interaction.values[0]);
     }
 
-    if (interaction.isButton() && interaction.customId === "ticket_close") {
+    if (
+      interaction.isButton() &&
+      interaction.customId === "ticket_close"
+    ) {
       return await closeTicket(interaction);
     }
 
@@ -1051,7 +1176,9 @@ client.on("interactionCreate", async interaction => {
 // ==========================================
 
 client.once("clientReady", async readyClient => {
-  console.log(`Safeguarding Assistant is online as ${readyClient.user.tag}.`);
+  console.log(
+    `Safeguarding Assistant is online as ${readyClient.user.tag}.`
+  );
 
   try {
     const rest = new REST({ version: "10" }).setToken(TOKEN);
@@ -1061,7 +1188,10 @@ client.once("clientReady", async readyClient => {
       { body: commands }
     );
 
-    console.log(`${commands.length} slash commands registered successfully.`);
+    console.log(
+      `${commands.length} slash commands registered successfully.`
+    );
+
   } catch (error) {
     console.error("Command registration failed:", error);
   }
